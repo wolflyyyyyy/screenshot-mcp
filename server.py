@@ -84,23 +84,45 @@ def tool_range_screenshot(url, start_text, end_text, output=None, padding=20):
 
     page = goto(url)
 
-    # ── 第一步：找到起始句的 DOM 节点 ──
+    # ── 第一步：找到起始句的位置 ──
     start_js = page.evaluate("""
     (text) => {
+        const cleaned = text.replace(/\\s+/g, '');
+
+        // 策略1：精确匹配单个文本节点
         const walker = document.createTreeWalker(
             document.body, NodeFilter.SHOW_TEXT, null, false
         );
         while (walker.nextNode()) {
             const node = walker.currentNode;
             if (node.textContent.includes(text)) {
-                const el = node.parentElement;
-                const box = el.getBoundingClientRect();
-                return {
-                    x: box.x, y: box.y,
-                    width: box.width, height: box.height,
-                    tag: el.tagName,
-                    text: node.textContent.trim().substring(0, 50)
-                };
+                const box = node.parentElement.getBoundingClientRect();
+                return { x: box.x, y: box.y, width: box.width, height: box.height };
+            }
+        }
+
+        // 策略2：跨节点拼接，但只取匹配到的最后一个节点的坐标
+        // （这样起点就是目标文字实际所在的行）
+        const allText = [];
+        const walker2 = document.createTreeWalker(
+            document.body, NodeFilter.SHOW_TEXT, null, false
+        );
+        while (walker2.nextNode()) {
+            allText.push({
+                text: walker2.currentNode.textContent,
+                el: walker2.currentNode.parentElement
+            });
+        }
+
+        for (let i = 0; i < allText.length; i++) {
+            let combined = '';
+            for (let j = i; j < Math.min(i + 15, allText.length); j++) {
+                combined += allText[j].text;
+                if (combined.replace(/\\s+/g, '').includes(cleaned)) {
+                    // 起点 = 匹配序列中最后一个节点（目标文字实际所在行）
+                    const box = allText[j].el.getBoundingClientRect();
+                    return { x: box.x, y: box.y, width: box.width, height: box.height };
+                }
             }
         }
         return null;
@@ -110,23 +132,57 @@ def tool_range_screenshot(url, start_text, end_text, output=None, padding=20):
     if not start_js:
         return {"success": False, "error": f"未找到起始句「{start_text[:20]}...」"}
 
-    # ── 第二步：找到结束句的 DOM 节点 ──
+    # ── 第二步：找到结束句的位置 ──
     end_js = page.evaluate("""
     (text) => {
+        const cleaned = text.replace(/\\s+/g, '');
+
+        // 辅助函数：找到包含文本的最合适的父容器
+        // 如果文字在 <pre>/<code>/<td> 等容器中，返回容器的坐标
+        function getContainerBox(el) {
+            let current = el;
+            while (current && current !== document.body) {
+                const tag = current.tagName.toLowerCase();
+                if (['pre', 'code', 'td', 'th', 'li', 'blockquote'].includes(tag)) {
+                    return current.getBoundingClientRect();
+                }
+                current = current.parentElement;
+            }
+            return el.getBoundingClientRect();
+        }
+
+        // 策略1：精确匹配
         const walker = document.createTreeWalker(
             document.body, NodeFilter.SHOW_TEXT, null, false
         );
         while (walker.nextNode()) {
             const node = walker.currentNode;
             if (node.textContent.includes(text)) {
-                const el = node.parentElement;
-                const box = el.getBoundingClientRect();
-                return {
-                    x: box.x, y: box.y,
-                    width: box.width, height: box.height,
-                    tag: el.tagName,
-                    text: node.textContent.trim().substring(0, 50)
-                };
+                const box = getContainerBox(node.parentElement);
+                return { x: box.x, y: box.y, width: box.width, height: box.height };
+            }
+        }
+
+        // 策略2：跨节点拼接
+        const allText = [];
+        const walker2 = document.createTreeWalker(
+            document.body, NodeFilter.SHOW_TEXT, null, false
+        );
+        while (walker2.nextNode()) {
+            allText.push({
+                text: walker2.currentNode.textContent,
+                el: walker2.currentNode.parentElement
+            });
+        }
+
+        for (let i = 0; i < allText.length; i++) {
+            let combined = '';
+            for (let j = i; j < Math.min(i + 15, allText.length); j++) {
+                combined += allText[j].text;
+                if (combined.replace(/\\s+/g, '').includes(cleaned)) {
+                    const box = getContainerBox(allText[j].el);
+                    return { x: box.x, y: box.y, width: box.width, height: box.height };
+                }
             }
         }
         return null;
@@ -137,9 +193,82 @@ def tool_range_screenshot(url, start_text, end_text, output=None, padding=20):
         return {"success": False, "error": f"未找到结束句「{end_text[:20]}...」"}
 
     # ── 第三步：计算截图区域 ──
+    # 先滚动到起始句可见，重新获取坐标（因为滚动后坐标会变）
+    page.evaluate(f"window.scrollTo(0, {start_js['y'] + page.evaluate('window.scrollY') - 50})")
+    page.wait_for_timeout(500)
+
+    # 重新获取两个节点的坐标（滚动后坐标变了）
+    start_js = page.evaluate("""
+    (text) => {
+        const cleaned = text.replace(/\\s+/g, '');
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+        while (walker.nextNode()) {
+            const node = walker.currentNode;
+            if (node.textContent.includes(text)) {
+                const box = node.parentElement.getBoundingClientRect();
+                return { x: box.x, y: box.y, width: box.width, height: box.height };
+            }
+        }
+        // 跨节点
+        const allText = [];
+        const w2 = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+        while (w2.nextNode()) allText.push({ text: w2.currentNode.textContent, el: w2.currentNode.parentElement });
+        for (let i = 0; i < allText.length; i++) {
+            let c = '';
+            for (let j = i; j < Math.min(i+15, allText.length); j++) {
+                c += allText[j].text;
+                if (c.replace(/\\s+/g,'').includes(cleaned)) {
+                    const box = allText[j].el.getBoundingClientRect();
+                    return { x: box.x, y: box.y, width: box.width, height: box.height };
+                }
+            }
+        }
+        return null;
+    }
+    """, start_text)
+
+    end_js = page.evaluate("""
+    (text) => {
+        const cleaned = text.replace(/\\s+/g, '');
+        function getContainerBox(el) {
+            let cur = el;
+            while (cur && cur !== document.body) {
+                const tag = cur.tagName.toLowerCase();
+                if (['pre','code','td','th','li','blockquote'].includes(tag))
+                    return cur.getBoundingClientRect();
+                cur = cur.parentElement;
+            }
+            return el.getBoundingClientRect();
+        }
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+        while (walker.nextNode()) {
+            const node = walker.currentNode;
+            if (node.textContent.includes(text)) {
+                return getContainerBox(node.parentElement);
+            }
+        }
+        const allText = [];
+        const w2 = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+        while (w2.nextNode()) allText.push({ text: w2.currentNode.textContent, el: w2.currentNode.parentElement });
+        for (let i = 0; i < allText.length; i++) {
+            let c = '';
+            for (let j = i; j < Math.min(i+15, allText.length); j++) {
+                c += allText[j].text;
+                if (c.replace(/\\s+/g,'').includes(cleaned))
+                    return getContainerBox(allText[j].el);
+            }
+        }
+        return null;
+    }
+    """, end_text)
+
+    if not start_js or not end_js:
+        return {"success": False, "error": "滚动后重新定位失败"}
+
+    extra_bottom = 30
     x = max(0, start_js["x"] - padding)
     y = max(0, start_js["y"] - padding)
-    end_bottom = end_js["y"] + end_js["height"] + padding
+    end_bottom = end_js["y"] + end_js["height"] + padding + extra_bottom
     w = max(start_js["width"], end_js["width"]) + padding * 2
     h = end_bottom - y
 
