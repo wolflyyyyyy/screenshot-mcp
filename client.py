@@ -1,147 +1,107 @@
 """
-MCP Client — 测试截图 MCP Server
-通过 subprocess 启动 server，通过 stdin/stdout 发送 JSON-RPC 请求
+MCP Client — 测试 range_screenshot
 """
-
-import subprocess
-import json
-import sys
-import io
-import os
-import time
+import subprocess, json, sys, io, os
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 
 class MCPClient:
-    def __init__(self, server_path: str):
-        self.process = subprocess.Popen(
+    def __init__(self, server_path):
+        self.proc = subprocess.Popen(
             [sys.executable, "-X", "utf8", server_path],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
-        self.request_id = 0
+        self._id = 0
 
-    def send_request(self, method: str, params: dict = None) -> dict:
-        """发送 JSON-RPC 请求并等待响应"""
-        self.request_id += 1
-        request = {
-            "jsonrpc": "2.0",
-            "id": self.request_id,
-            "method": method,
-        }
+    def call(self, method, params=None):
+        self._id += 1
+        req = {"jsonrpc": "2.0", "id": self._id, "method": method}
         if params:
-            request["params"] = params
+            req["params"] = params
+        self.proc.stdin.write((json.dumps(req, ensure_ascii=False) + "\n").encode())
+        self.proc.stdin.flush()
+        resp = json.loads(self.proc.stdout.readline().decode())
+        return resp
 
-        # 发送（用 UTF-8 编码）
-        line = json.dumps(request, ensure_ascii=False)
-        self.process.stdin.write((line + "\n").encode("utf-8"))
-        self.process.stdin.flush()
-
-        # 接收（读取 UTF-8 编码的字节）
-        response_line = self.process.stdout.readline().decode("utf-8")
-        if response_line:
-            return json.loads(response_line.strip())
-        return None
-
-    def call_tool(self, tool_name: str, arguments: dict) -> dict:
-        """调用 MCP 工具"""
-        result = self.send_request("tools/call", {
-            "name": tool_name,
-            "arguments": arguments
-        })
-        if result and "result" in result:
-            content = result["result"].get("content", [])
-            if content:
-                return json.loads(content[0]["text"])
-        elif result and "error" in result:
-            return {"error": result["error"]}
-        return {"error": "No response"}
-
-    def initialize(self) -> dict:
-        """初始化 MCP 连接"""
-        return self.send_request("initialize", {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "test-client", "version": "1.0.0"}
-        })
-
-    def list_tools(self) -> list:
-        """列出所有可用工具"""
-        result = self.send_request("tools/list")
-        if result and "result" in result:
-            return result["result"].get("tools", [])
-        return []
+    def tool(self, name, args):
+        resp = self.call("tools/call", {"name": name, "arguments": args})
+        if "result" in resp and "content" in resp["result"]:
+            return json.loads(resp["result"]["content"][0]["text"])
+        return resp
 
     def close(self):
-        self.process.terminate()
-        self.process.wait()
+        self.proc.terminate()
 
 
 def main():
-    server_path = os.path.join(os.path.dirname(__file__), "server.py")
-    client = MCPClient(server_path)
+    client = MCPClient(os.path.join(os.path.dirname(__file__), "server.py"))
 
     print("=" * 60)
-    print("MCP Screenshot Server 测试")
+    print("  Screenshot MCP v3 — range_screenshot 测试")
     print("=" * 60)
 
-    # 1. 初始化
-    print("\n[1] 初始化连接...")
-    init_result = client.initialize()
-    print(f"  服务端: {init_result.get('result', {}).get('serverInfo', {})}")
-
-    # 2. 列出工具
-    print("\n[2] 获取工具列表...")
-    tools = client.list_tools()
-    for t in tools:
-        print(f"  🔧 {t['name']}: {t['description']}")
-
-    # 3. 测试：精准截图「本周目标」
-    print("\n[3] 测试 screenshot_element — 截图「本周目标」")
-    result = client.call_tool("screenshot_element", {
-        "url": "https://weekfupan.top/",
-        "keyword": "本周目标"
+    # 初始化
+    client.call("initialize", {
+        "protocolVersion": "2024-11-05",
+        "capabilities": {},
+        "clientInfo": {"name": "test", "version": "1.0.0"}
     })
-    print(f"  结果: {json.dumps(result, ensure_ascii=False, indent=2)}")
 
-    # 4. 测试：精准截图「周四」
-    print("\n[4] 测试 screenshot_element — 截图「周四」")
-    result = client.call_tool("screenshot_element", {
+    # 列出工具
+    tools = client.call("tools/list")
+    print("\n可用工具：")
+    for t in tools["result"]["tools"]:
+        print(f"  🔧 {t['name']}")
+
+    # ── 测试1：同一屏内的范围截图 ──
+    print("\n" + "─" * 60)
+    print("测试1：同一屏 — 截图「本周目标」到「周五 (6/19)」")
+    print("─" * 60)
+    r = client.tool("range_screenshot", {
         "url": "https://weekfupan.top/",
-        "keyword": "周四"
+        "start_text": "本周目标",
+        "end_text": "周五 (6/19)"
     })
-    print(f"  结果: {json.dumps(result, ensure_ascii=False, indent=2)}")
+    print(json.dumps(r, ensure_ascii=False, indent=2))
 
-    # 5. 测试：段落截图「时间预算」
-    print("\n[5] 测试 screenshot_section — 截图「时间预算」所在段落")
-    result = client.call_tool("screenshot_section", {
+    # ── 测试2：整个页面的范围截图 ──
+    print("\n" + "─" * 60)
+    print("测试2：跨区域 — 截图「本周目标」到「总计：9h」")
+    print("─" * 60)
+    r = client.tool("range_screenshot", {
         "url": "https://weekfupan.top/",
-        "keyword": "时间预算"
+        "start_text": "本周目标",
+        "end_text": "总计：9h"
     })
-    print(f"  结果: {json.dumps(result, ensure_ascii=False, indent=2)}")
+    print(json.dumps(r, ensure_ascii=False, indent=2))
 
-    # 6. 测试：导航到「今日」标签页
-    print("\n[6] 测试 navigate — 切换到「今日」标签页")
-    result = client.call_tool("navigate", {
+    # ── 测试3：精准截一行 ──
+    print("\n" + "─" * 60)
+    print("测试3：精准 — 只截「周一 (6/15)」到「周二 (6/16)」")
+    print("─" * 60)
+    r = client.tool("range_screenshot", {
         "url": "https://weekfupan.top/",
-        "click_text": "今日"
+        "start_text": "周一 (6/15)",
+        "end_text": "周二 (6/16)"
     })
-    print(f"  结果: {json.dumps(result, ensure_ascii=False, indent=2)}")
+    print(json.dumps(r, ensure_ascii=False, indent=2))
 
-    # 7. 测试：长截图「每日安排」（今日页有 9 个时间格，适合长截图）
-    print("\n[7] 测试 screenshot_long — 长截图「每日安排」")
-    result = client.call_tool("screenshot_long", {
+    # ── 测试4：导航到「今日」页再截图 ──
+    print("\n" + "─" * 60)
+    print("测试4：导航到「今日」→ 截图「每日安排」到「0/0 项完成」")
+    print("─" * 60)
+    client.tool("navigate", {"url": "https://weekfupan.top/", "click_text": "今日"})
+    r = client.tool("range_screenshot", {
         "url": "https://weekfupan.top/",
-        "keyword": "每日安排"
+        "start_text": "每日安排",
+        "end_text": "0/0 项完成"
     })
-    print(f"  结果: {json.dumps(result, ensure_ascii=False, indent=2)}")
+    print(json.dumps(r, ensure_ascii=False, indent=2))
 
-    # 关闭
     client.close()
     print("\n" + "=" * 60)
-    print("全部测试完成！截图文件在 screenshot_mcp/ 目录下")
+    print("全部完成！截图在 screenshot_mcp/ 目录下")
     print("=" * 60)
 
 
